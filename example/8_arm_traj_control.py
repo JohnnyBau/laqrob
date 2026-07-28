@@ -11,7 +11,7 @@ Input: x y z [roll pitch yaw] [duration]  target end-effector pose (meters / rad
 用法 / Usage:
     python example/8_arm_traj_control.py
 
-退出 / Exit: q / quit / exit
+退出 / Exit: q / quit / exit /ctrl+c
 状态 / State: state, end_state
 """
 
@@ -34,7 +34,7 @@ def main() -> None:
     while True:
         try:
             line = input("> ").strip()
-        except EOFError:
+        except (EOFError, KeyboardInterrupt):
             break
 
         if not line:
