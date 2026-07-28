@@ -15,10 +15,11 @@ manually moved freely while real-time joint angles (degrees) are printed.
 
     python example/2_zero_and_read.py rebotarm_dm.yaml
       强制指定硬件配置文件
-      Force a specific hardware config file
+     Force a specific hardware config file
 """
 import time
 import sys
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -34,8 +35,25 @@ print(f"[{rebotarm.hardware_yaml}] Using config: {rebotarm.hardware_yaml}")
 rebotarm.connect()
 print("--- 连接成功 ---")
 print("--- Connection OK ---\n")
+
+# 后台反馈线程：零点校准约需 20s，期间实时打印进度，避免误以为卡死
+# Background thread: zero calibration takes ~20s; print live progress so the
+# user doesn't think the program is frozen.
+_zeroing = True
+
+
+def _zero_progress() -> None:
+    start = time.time()
+    while _zeroing:
+        print(f"\r正在设置零点 / Setting zero... {time.time() - start:.0f}s",
+              end="", flush=True)
+        time.sleep(1.0)
+
+
+threading.Thread(target=_zero_progress, daemon=True).start()
 rebotarm.set_zero()
-print("--- 零点已设置 ---")
+_zeroing = False
+print("\r--- 零点已设置 ---" + " " * 30)
 print("--- Zero set ---\n")
 
 n_arm = rebotarm.arm.num_joints
