@@ -6,17 +6,24 @@ kannst ihn frei mit der Hand fuehren. Die Pose wird per FK live berechnet
 und in einem Browser-Plot dargestellt (matplotlib WebAgg-Backend -- kein
 Display am Pi noetig).
 
+Ueber den Status-Text (Port 8990) laesst sich die aktuelle Pose per Formular
+als benannte Pose in poses.json speichern (gleiches Format wie teach.py) --
+anschliessend mit example/playback.py anfahrbar.
+
 Nutzung:
     uv run python example/live_pose_plot.py
-    -> im Browser (vom PC aus) http://<pi-ip>:8988 oeffnen
+    -> im Browser (vom PC aus) http://<pi-ip>:8989 oeffnen (Plot)
+    -> http://<pi-ip>:8990 oeffnen (Status-Text + Pose speichern)
     Strg+C im Terminal zum Beenden.
 """
+import html
 import http.server
 import sys
 import threading
 import time
 from collections import deque
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -34,7 +41,7 @@ import pinocchio as pin
 from reBotArm_control_py.actuator import RebotArm
 from reBotArm_control_py.kinematics import joint_to_pose, pad_q_for_model
 
-from _common import gravity_hold
+from _common import gravity_hold, load_poses, save_poses, POSES_FILE
 from example.sim.visualizer import Visualizer
 
 WINDOW_S = 20.0
@@ -44,17 +51,65 @@ STATUS_INTERVAL_S = 10.0
 STATUS_HTTP_PORT = 8990
 
 _status_lock = threading.Lock()
-_status_holder = {"text": "warte auf erstes Update..."}
+_status_holder = {"text": "warte auf erstes Update...", "saved_msg": ""}
+_state_lock = threading.Lock()
+_latest_state = {"q": None, "pos": None, "rpy": None}
+_n_arm = None  # von main() gesetzt
+
+
+def _save_pose(name: str, gripper: str) -> str:
+    with _state_lock:
+        q, pos, rpy = _latest_state["q"], _latest_state["pos"], _latest_state["rpy"]
+    if q is None:
+        return "Noch keine Pose verfuegbar -- kurz warten und erneut versuchen."
+    poses = load_poses()
+    entry = {
+        "name": name if name else f"pose_{len(poses) + 1}",
+        "x": float(pos[0]), "y": float(pos[1]), "z": float(pos[2]),
+        "roll": float(rpy[0]), "pitch": float(rpy[1]), "yaw": float(rpy[2]),
+        "duration": 2.0,
+        "gripper": gripper if gripper in ("open", "close") else "none",
+        # reale Gelenkwinkel: playback.py faehrt darauf direkt (Min-Jerk, keine IK).
+        "q": [float(v) for v in q[:_n_arm]],
+    }
+    poses.append(entry)
+    save_poses(poses)
+    return f"gespeichert: '{entry['name']}' ({len(poses)} Posen in {POSES_FILE})"
 
 
 class _StatusHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802 -- von http.server vorgegeben
+        parsed = urlparse(self.path)
+        if parsed.path == "/save":
+            qs = parse_qs(parsed.query)
+            name = qs.get("name", [""])[0].strip()
+            gripper = qs.get("gripper", ["none"])[0]
+            with _status_lock:
+                _status_holder["saved_msg"] = _save_pose(name, gripper)
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.end_headers()
+            return
+
         with _status_lock:
             text = _status_holder["text"]
+            saved_msg = _status_holder["saved_msg"]
+        saved_html = f"<p style='color:green'>{html.escape(saved_msg)}</p>" if saved_msg else ""
         body = (
             "<html><head><meta http-equiv='refresh' content='2'>"
-            "<meta charset='utf-8'></head>"
-            f"<body><pre style='font-size:18px'>{text}</pre></body></html>"
+            "<meta charset='utf-8'></head><body>"
+            f"<pre style='font-size:18px'>{text}</pre>"
+            "<form action='/save' method='get'>"
+            "Name: <input name='name' type='text'> "
+            "Greifer: <select name='gripper'>"
+            "<option value='none'>keine Aktion</option>"
+            "<option value='open'>oeffnen</option>"
+            "<option value='close'>schliessen</option>"
+            "</select> "
+            "<button type='submit'>Pose speichern</button>"
+            "</form>"
+            f"{saved_html}"
+            "</body></html>"
         ).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -76,6 +131,7 @@ VECTOR_NAMES = ["vx", "vy", "vz"]
 
 
 def main() -> None:
+    global _n_arm
     rebotarm = RebotArm()
     rebotarm.connect()
     rebotarm.arm.mode_mit()
@@ -83,8 +139,9 @@ def main() -> None:
         rebotarm.gripper.mode_mit()
     rebotarm.enable_all()
     rebotarm.start_control_loop(gravity_hold, rate=rebotarm.rate)
+    _n_arm = rebotarm.arm.num_joints
     threading.Thread(target=_start_status_http_server, daemon=True).start()
-    print(f"Kopierbarer Status-Text: http://0.0.0.0:{STATUS_HTTP_PORT}")
+    print(f"Kopierbarer Status-Text + Pose speichern: http://0.0.0.0:{STATUS_HTTP_PORT}")
 
     viz = Visualizer()
     print(f"3D-Simulation: {viz.meshcat.url().replace('127.0.0.1', '192.168.178.130')}")
@@ -119,6 +176,10 @@ def main() -> None:
         pos, rpy = joint_to_pose(q)
         rpy_deg = np.degrees(rpy)
         gripper_vec = pin.rpy.rpyToMatrix(*rpy) @ np.array([1.0, 0.0, 0.0])  # Greifrichtung = lokale X-Achse von end_link (per FK-Test verifiziert, nicht Z)
+        with _state_lock:
+            _latest_state["q"] = q.copy()
+            _latest_state["pos"] = pos
+            _latest_state["rpy"] = rpy
         t_buf.append(time.time() - t0)
         for i, v in enumerate(list(pos) + [rpy_deg[0]]):
             val_buf[i].append(v)
