@@ -10,11 +10,16 @@ Ueber den Status-Text (Port 8990) laesst sich die aktuelle Pose per Formular
 als benannte Pose in poses.json speichern (gleiches Format wie teach.py) --
 anschliessend mit example/playback.py anfahrbar.
 
-Nutzung:
+Als CLI-Skript:
     uv run python example/live_pose_plot.py
     -> im Browser (vom PC aus) http://<pi-ip>:8989 oeffnen (Plot)
     -> http://<pi-ip>:8990 oeffnen (Status-Text + Pose speichern)
     Strg+C im Terminal zum Beenden.
+
+Als importierbare Funktion (fuer andere Programme -- blockiert, bis das
+Fenster geschlossen/Strg+C gedrueckt wird, dann Rueckgabe):
+    from example.live_pose_plot import run
+    gespeicherte_posen = run()  # Liste von Posen dieser Sitzung, inkl. Greiferposition
 """
 import html
 import http.server
@@ -54,7 +59,9 @@ _status_lock = threading.Lock()
 _status_holder = {"text": "warte auf erstes Update...", "saved_msg": ""}
 _state_lock = threading.Lock()
 _latest_state = {"q": None, "pos": None, "rpy": None}
-_n_arm = None  # von main() gesetzt
+_n_arm = None  # von run() gesetzt
+_has_gripper = False  # von run() gesetzt
+_session_saves: list[dict] = []  # in dieser Sitzung gespeicherte Posen -- Rueckgabe von run()
 
 
 def _save_pose(name: str, gripper: str) -> str:
@@ -63,17 +70,21 @@ def _save_pose(name: str, gripper: str) -> str:
     if q is None:
         return "Noch keine Pose verfuegbar -- kurz warten und erneut versuchen."
     poses = load_poses()
+    gripper_pos = float(q[_n_arm]) if _has_gripper else None  # Gelenkwinkel des Greifers (letztes Gelenk)
     entry = {
         "name": name if name else f"pose_{len(poses) + 1}",
         "x": float(pos[0]), "y": float(pos[1]), "z": float(pos[2]),
         "roll": float(rpy[0]), "pitch": float(rpy[1]), "yaw": float(rpy[2]),
         "duration": 2.0,
         "gripper": gripper if gripper in ("open", "close") else "none",
+        "gripper_pos": gripper_pos,
         # reale Gelenkwinkel: playback.py faehrt darauf direkt (Min-Jerk, keine IK).
         "q": [float(v) for v in q[:_n_arm]],
     }
     poses.append(entry)
     save_poses(poses)
+    with _state_lock:
+        _session_saves.append(dict(entry))
     return f"gespeichert: '{entry['name']}' ({len(poses)} Posen in {POSES_FILE})"
 
 
@@ -130,8 +141,15 @@ VECTOR_LABEL = "Greifer-Vektor [-]"
 VECTOR_NAMES = ["vx", "vy", "vz"]
 
 
-def main() -> None:
-    global _n_arm
+def run() -> list[dict]:
+    """Startet Live-Plot + Simulation, blockiert bis Fensterschluss/Strg+C.
+
+    Rueckgabe: Liste der in dieser Sitzung ueber das Speichern-Formular
+    gesicherten Posen (x/y/z/roll/pitch/yaw/q/gripper/gripper_pos) -- fuer
+    weitere Programmaufrufe (z.B. direkte Weiterverarbeitung ohne poses.json).
+    """
+    global _n_arm, _has_gripper
+    _session_saves.clear()
     rebotarm = RebotArm()
     rebotarm.connect()
     rebotarm.arm.mode_mit()
@@ -140,6 +158,7 @@ def main() -> None:
     rebotarm.enable_all()
     rebotarm.start_control_loop(gravity_hold, rate=rebotarm.rate)
     _n_arm = rebotarm.arm.num_joints
+    _has_gripper = rebotarm.has_gripper
     threading.Thread(target=_start_status_http_server, daemon=True).start()
     print(f"Kopierbarer Status-Text + Pose speichern: http://0.0.0.0:{STATUS_HTTP_PORT}")
 
@@ -217,6 +236,14 @@ def main() -> None:
     finally:
         print("\nbeende...")
         rebotarm.disconnect()
+
+    with _state_lock:
+        return list(_session_saves)
+
+
+def main() -> None:
+    saved = run()
+    print(f"{len(saved)} Pose(n) in dieser Sitzung gespeichert.")
 
 
 if __name__ == "__main__":
