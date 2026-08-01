@@ -61,6 +61,7 @@ from ..kinematics import (
 )
 from ..kinematics.inverse_kinematics import (
     solve_ik,
+    solve_ik_with_retry,
     IKParams as TrajIKParams,
 )
 from ..trajectory import (
@@ -103,15 +104,25 @@ class RebotArmEndPose:
 
         self._traj_params = TrajPlanParams(dt=dt, profile=profile)
         self._ik_solver_params = TrajIKParams(
-            max_iter=200, tolerance=1e-4, step_size=0.5, damping=1e-6,
+            max_iter=200, tolerance=2e-3, step_size=0.5, damping=1e-6,
         )
+        self._ik_max_retries = 150
         self._clik_params = ClikIKParams(
-            max_iter=200, tolerance=1e-4, damping=1e-6, step_size=0.8,
+            max_iter=50, tolerance=1e-3, damping=1e-6, step_size=0.8,
         )
+        # Sicherheitsgrenze: CLIK kann an Singularitaeten/Konfigurations-
+        # mehrdeutigkeiten stellenweise nicht konvergieren -- ohne Pruefung
+        # wuerde der Arm dann zwischen zwei Punkten "schnappen" (siehe
+        # move_to_traj()). 5 rad/s liegt weit ueber normalen Bewegungen
+        # (~1 rad/s beobachtet), faengt aber echte Spruenge (>50 rad/s) ab.
+        self._max_joint_speed = 5.0
 
         self._q_target: np.ndarray = np.zeros(self._n)
         self._qd_target: np.ndarray = np.zeros(self._n)
         self._gripper_target: float = 0.0
+        self._gripper_force_mode: bool = False
+        self._gripper_tau: float = 0.0
+        self._gripper_kd_force: float = 0.3
         self._running = False
 
         self._traj: list[np.ndarray] = []
@@ -138,6 +149,23 @@ class RebotArmEndPose:
         if self._has_gripper:
             self._gripper_group.mode_mit()
             self._gripper_group.enable()
+
+        # Ist-Position uebernehmen, bevor der Regelkreis startet -- sonst wuerde er
+        # sofort mit vollem kp/kd Richtung der bei __init__ initialisierten
+        # Nullstellung ziehen (gefaehrlicher Sprung, unabhaengig vom ersten move_to_*).
+        # Direkt nach connect()/enable() ist noch kein echtes Feedback da (get_state()
+        # liefert dann Nullen als Platzhalter) -- daher mehrfach pollen, bis reale
+        # Werte ankommen.
+        pos = np.zeros(self._n + (1 if self._has_gripper else 0))
+        for _ in range(25):
+            pos, _, _ = self.rebotarm.get_state()
+            if np.any(pos != 0.0):
+                break
+            time.sleep(0.02)
+        self._q_target = pos[: self._n].copy()
+        if self._has_gripper:
+            self._gripper_target = float(pos[-1])
+
         self.rebotarm.start_control_loop(self._loop_cb)
         self._running = True
 
@@ -159,16 +187,17 @@ class RebotArmEndPose:
     def set_gripper_target(self, pos: float) -> None:
         self._gripper_target = float(pos)
 
-    def open_gripper(self) -> None:
+    def open_gripper(self, tau: float = -1.0) -> None:
+        """Kraftregelung (kp=0): konstantes Oeffnungs-Drehmoment tau [Nm] (kalibriert: negativ=oeffnen)."""
         if self._has_gripper:
-            self._gripper_group._mit_kp.fill(0)
-            self._gripper_group._mit_kd.fill(0)
-            pv = self._gripper_group._pv_vlim
-            self._gripper_target = float(pv[0]) if pv.size > 0 else 0.0
+            self._gripper_force_mode = True
+            self._gripper_tau = float(tau)
 
-    def close_gripper(self) -> None:
+    def close_gripper(self, tau: float = 1.0) -> None:
+        """Kraftregelung (kp=0): konstantes Greif-Drehmoment tau [Nm] (kalibriert: positiv=schliessen)."""
         if self._has_gripper:
-            self._gripper_target = 0.0
+            self._gripper_force_mode = True
+            self._gripper_tau = float(tau)
 
     def safe_home(
         self,
@@ -242,10 +271,10 @@ class RebotArmEndPose:
             np.array([x, y, z]), roll=roll, pitch=pitch, yaw=yaw,
         )
 
-        result = solve_ik(
+        result = solve_ik_with_retry(
             self._model, self._data, self._end_frame_id,
             T_target, q_curr, self._ik_solver_params,
-            controlled_joints=self._n,
+            max_retries=self._ik_max_retries,
         )
         if not result.success:
             print(f"[RebotArmEndPose/IK] IK 未收敛  err={result.error:.3e}")
@@ -274,10 +303,14 @@ class RebotArmEndPose:
             np.array([x, y, z]), roll=roll, pitch=pitch, yaw=yaw,
         )
 
-        ik_result = solve_ik(
+        ik_result = solve_ik_with_retry(
             self._model, self._data, self._end_frame_id,
-            T_target, q_start, self._ik_solver_params,
-            controlled_joints=self._n,
+            # q_start.copy(): solve_ik_with_retry ueberschreibt q_seed in-place
+            # mit der Loesung -- ohne copy() wuerde q_start selbst (unten fuer
+            # T_start gebraucht) auf den Zielwert ueberschrieben und die
+            # gesamte Geodaete auf einen Punkt kollabieren.
+            T_target, q_start.copy(), self._ik_solver_params,
+            max_retries=self._ik_max_retries,
         )
         if not ik_result.success:
             print(f"[RebotArmEndPose/Traj] IK 失败  err={ik_result.error:.4f}")
@@ -307,6 +340,53 @@ class RebotArmEndPose:
             return False
 
         pts = [pt.q[: self._n].copy() for pt in joint_traj]
+
+        n_fail = sum(1 for pt in joint_traj if not pt.ik_success)
+        max_step = max(
+            (float(np.abs(pts[i + 1] - pts[i]).max()) for i in range(len(pts) - 1)),
+            default=0.0,
+        )
+        max_speed = max_step / self._traj_params.dt
+        if max_speed > self._max_joint_speed:
+            print(f"[RebotArmEndPose/Traj] Sicherheitsabbruch: Gelenksprung "
+                  f"{max_speed:.2f} rad/s (> {self._max_joint_speed} rad/s, "
+                  f"nicht_konvergiert={n_fail}/{len(pts)}) -- CLIK vermutlich an "
+                  f"Singularitaet/Mehrdeutigkeit gescheitert. Bewegung wird NICHT gesendet.")
+            return False
+
+        self._stop_send.set()
+        if self._send_thread is not None:
+            self._send_thread.join(timeout=5.0)
+
+        self._traj = pts
+        self._moving = True
+        self._stop_send.clear()
+        self._send_thread = threading.Thread(
+            target=self._send_loop, args=(duration,), daemon=True,
+        )
+        self._send_thread.start()
+        return True
+
+    def move_to_q_traj(self, q_target: np.ndarray, duration: float = 2.0) -> bool:
+        """Faehrt direkt zu einer geteachten Gelenkkonfiguration (Min-Jerk, Gelenkraum).
+
+        Im Gegensatz zu move_to_traj() wird KEINE IK geloest -- q_target ist die beim
+        Teachen real gefahrene, damit garantiert erreichbare Konfiguration. Dadurch
+        entfallen CLIK-Mehrdeutigkeiten/Singularitaeten zwischen weit auseinander
+        liegenden Posen komplett (siehe move_to_traj()-Sicherheitsabbruch).
+        """
+        if not self._running:
+            return False
+
+        q_start, _, _ = self.rebotarm.get_state()
+        q_start = pad_q_for_model(self._model, q_start, self._n)
+        q_target = pad_q_for_model(self._model, np.asarray(q_target, dtype=float), self._n)
+
+        dt = self._traj_params.dt
+        n_pts = max(2, int(duration / dt))
+        s = np.linspace(0.0, 1.0, n_pts)
+        blend = 10.0 * s ** 3 - 15.0 * s ** 4 + 6.0 * s ** 5  # Min-Jerk (wie safe_home())
+        pts = [q_start + (q_target - q_start) * b for b in blend]
 
         self._stop_send.set()
         if self._send_thread is not None:
@@ -349,11 +429,20 @@ class RebotArmEndPose:
                 )
                 self._arm_group.send_pos_vel(self._q_target, vlim=vlim)
         if self._has_gripper:
-            self._gripper_group.send_mit(
-                np.array([self._gripper_target]),
-                kp=self._gripper_group._mit_kp,
-                kd=self._gripper_group._mit_kd,
-            )
+            if self._gripper_force_mode:
+                # Kraftregelung: kp=0 -> Zielposition irrelevant, konstantes Drehmoment.
+                self._gripper_group.send_mit(
+                    np.array([self._gripper_target]),
+                    kp=np.zeros(1),
+                    kd=np.full(1, self._gripper_kd_force),
+                    tau=np.array([self._gripper_tau]),
+                )
+            else:
+                self._gripper_group.send_mit(
+                    np.array([self._gripper_target]),
+                    kp=self._gripper_group._mit_kp,
+                    kd=self._gripper_group._mit_kd,
+                )
 
     # ── 轨迹发送线程 ──────────────────────────────────────────────────────
 

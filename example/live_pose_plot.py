@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""Live-Plot: Endeffektor-Pose (x/y/z/roll + Greifer-Vektor) waehrend Free-Drive.
+
+Arm haengt in Gravitationskompensation (wie teach.py, unveraendert), du
+kannst ihn frei mit der Hand fuehren. Die Pose wird per FK live berechnet
+und in einem Browser-Plot dargestellt (matplotlib WebAgg-Backend -- kein
+Display am Pi noetig).
+
+Nutzung:
+    uv run python example/live_pose_plot.py
+    -> im Browser (vom PC aus) http://<pi-ip>:8988 oeffnen
+    Strg+C im Terminal zum Beenden.
+"""
+import http.server
+import sys
+import threading
+import time
+from collections import deque
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import matplotlib
+matplotlib.use("WebAgg")
+matplotlib.rcParams["webagg.address"] = "0.0.0.0"
+matplotlib.rcParams["webagg.port"] = 8989
+matplotlib.rcParams["webagg.open_in_browser"] = False
+
+import matplotlib.animation as animation
+import matplotlib.pyplot as plt
+import numpy as np
+import pinocchio as pin
+
+from reBotArm_control_py.actuator import RebotArm
+from reBotArm_control_py.kinematics import joint_to_pose, pad_q_for_model
+
+from _common import gravity_hold
+from example.sim.visualizer import Visualizer
+
+WINDOW_S = 20.0
+SAMPLE_HZ = 20.0
+N = int(WINDOW_S * SAMPLE_HZ)
+STATUS_INTERVAL_S = 10.0
+STATUS_HTTP_PORT = 8990
+
+_status_lock = threading.Lock()
+_status_holder = {"text": "warte auf erstes Update..."}
+
+
+class _StatusHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):  # noqa: N802 -- von http.server vorgegeben
+        with _status_lock:
+            text = _status_holder["text"]
+        body = (
+            "<html><head><meta http-equiv='refresh' content='2'>"
+            "<meta charset='utf-8'></head>"
+            f"<body><pre style='font-size:18px'>{text}</pre></body></html>"
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):  # keine Konsolenausgabe pro Request
+        pass
+
+
+def _start_status_http_server() -> None:
+    server = http.server.ThreadingHTTPServer(("0.0.0.0", STATUS_HTTP_PORT), _StatusHandler)
+    server.serve_forever()
+
+LABELS = ["x [m]", "y [m]", "z [m]", "roll [deg]"]
+VECTOR_LABEL = "Greifer-Vektor [-]"
+VECTOR_NAMES = ["vx", "vy", "vz"]
+
+
+def main() -> None:
+    rebotarm = RebotArm()
+    rebotarm.connect()
+    rebotarm.arm.mode_mit()
+    if rebotarm.has_gripper:
+        rebotarm.gripper.mode_mit()
+    rebotarm.enable_all()
+    rebotarm.start_control_loop(gravity_hold, rate=rebotarm.rate)
+    threading.Thread(target=_start_status_http_server, daemon=True).start()
+    print(f"Kopierbarer Status-Text: http://0.0.0.0:{STATUS_HTTP_PORT}")
+
+    viz = Visualizer()
+    print(f"3D-Simulation: {viz.meshcat.url().replace('127.0.0.1', '192.168.178.130')}")
+
+    t_buf = deque(maxlen=N)
+    val_buf = [deque(maxlen=N) for _ in range(len(LABELS))]
+    vector_buf = [deque(maxlen=N) for _ in range(3)]
+    t0 = time.time()
+
+    fig, axes = plt.subplots(len(LABELS) + 1, 1, sharex=True, figsize=(8, 10))
+    lines = []
+    for ax, label in zip(axes, LABELS):
+        (line,) = ax.plot([], [])
+        ax.set_ylabel(label)
+        ax.grid(True)
+        lines.append(line)
+    vector_axis = axes[-1]
+    vector_lines = [vector_axis.plot([], [], label=name)[0] for name in VECTOR_NAMES]
+    vector_axis.set_ylabel(VECTOR_LABEL)
+    vector_axis.set_ylim(-1.1, 1.1)  # Einheitsvektor -- Bereich ist fest bekannt
+    vector_axis.legend(loc="upper right", fontsize=8)
+    vector_axis.grid(True)
+    axes[-1].set_xlabel("t [s]")
+    fig.suptitle("Live Endeffektor-Pose (Free-Drive) -- Strg+C im Terminal zum Beenden")
+    status_text = fig.text(0.5, 0.955, "", ha="center", va="top", fontsize=9, family="monospace")
+    fig.subplots_adjust(top=0.90)
+    last_status_t = -STATUS_INTERVAL_S  # sofort beim ersten Frame anzeigen
+
+    def update(_frame):
+        nonlocal last_status_t
+        q, _, _ = rebotarm.get_state(request_feedback=False)  # kein Extra-Buszugriff -- stoert sonst gravity_hold() (500Hz)
+        pos, rpy = joint_to_pose(q)
+        rpy_deg = np.degrees(rpy)
+        gripper_vec = pin.rpy.rpyToMatrix(*rpy) @ np.array([1.0, 0.0, 0.0])  # Greifrichtung = lokale X-Achse von end_link (per FK-Test verifiziert, nicht Z)
+        t_buf.append(time.time() - t0)
+        for i, v in enumerate(list(pos) + [rpy_deg[0]]):
+            val_buf[i].append(v)
+        for i, v in enumerate(gripper_vec):
+            vector_buf[i].append(v)
+        viz.update(pad_q_for_model(viz.model, q))
+        if t_buf[-1] - last_status_t >= STATUS_INTERVAL_S:
+            last_status_t = t_buf[-1]
+            line_text = (
+                f"t={t_buf[-1]:6.1f}s  x={pos[0]:+.3f}  y={pos[1]:+.3f}  z={pos[2]:+.3f}  "
+                f"roll={rpy_deg[0]:+6.1f}  "
+                f"vec=({gripper_vec[0]:+.3f}, {gripper_vec[1]:+.3f}, {gripper_vec[2]:+.3f})"
+            )
+            status_text.set_text(line_text)
+            with _status_lock:
+                _status_holder["text"] = line_text
+        for i, line in enumerate(lines):
+            line.set_data(t_buf, val_buf[i])
+            axes[i].relim()
+            axes[i].autoscale_view()
+        for i, line in enumerate(vector_lines):
+            line.set_data(t_buf, vector_buf[i])
+        if t_buf:
+            for ax in axes:
+                ax.set_xlim(max(0.0, t_buf[-1] - WINDOW_S), t_buf[-1] + 0.5)
+        return lines + vector_lines + [status_text]
+
+    ani = animation.FuncAnimation(
+        fig, update, interval=int(1000 / SAMPLE_HZ), cache_frame_data=False,
+    )
+    try:
+        plt.show()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print("\nbeende...")
+        rebotarm.disconnect()
+
+
+if __name__ == "__main__":
+    main()
