@@ -14,8 +14,9 @@ import numpy as np
 from reBotArm_control_py.actuator import RebotArm
 from reBotArm_control_py.dynamics import compute_generalized_gravity
 
-# Posen bewusst ausserhalb des Repos ablegen.
-POSES_DIR = Path.home() / "rebotarm_poses"
+# Posen im Repo ablegen (example/poses.json), damit teach.py/live_pose_plot.py/
+# playback.py immer dieselbe, versionierte Datei verwenden.
+POSES_DIR = Path(__file__).resolve().parent
 POSES_FILE = POSES_DIR / "poses.json"
 
 GRIPPER_ACTIONS = ("open", "close", "none")
