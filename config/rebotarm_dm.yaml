@@ -11,9 +11,9 @@
 # Kinematics config (URDF path, end-effector frame)
 
 urdf_path: "urdf/reBot-DevArm_fixend_description/urdf/reBot-DevArm_fixend.urdf"
-end_effector_frame: "end_link"
+end_effector_frame: "gripper_tip"
 
-channel: /dev/ttyACM0
+channel: /dev/ttyACM1
 rate: 500
 
 groups:
