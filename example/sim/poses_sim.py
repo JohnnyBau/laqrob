@@ -31,7 +31,7 @@ import pinocchio as pin
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from reBotArm_control_py.kinematics import compute_fk, get_end_effector_frame_id
+from reBotArm_control_py.kinematics import compute_fk, get_end_effector_frame_id, pad_q_for_model
 from reBotArm_control_py.kinematics.inverse_kinematics import (
     pos_rot_to_se3,
     solve_ik_with_retry,
@@ -98,7 +98,13 @@ def move_to_pose(viz, model, end_frame_id, q_start, pose, duration, dt=1.0 / 50.
         np.array([pose["x"], pose["y"], pose["z"]]),
         rot=pose_target_rot(pose),
     )
-    ik_result = solve_ik_with_retry(model, data, end_frame_id, target, q_start.copy(), ik_params)
+    # Mit den in der Pose gespeicherten Gelenkwinkeln seeden statt mit der vorherigen
+    # Armstellung -- vermeidet, dass die IK in einen anderen (falschen) Loesungsast springt.
+    if "q" in pose:
+        q_seed = pad_q_for_model(model, np.array(pose["q"], dtype=float))
+    else:
+        q_seed = q_start.copy()
+    ik_result = solve_ik_with_retry(model, data, end_frame_id, target, q_seed, ik_params)
     if not ik_result.success:
         print(f"  [WARN] IK fuer Pose '{pose.get('name', '?')}' nicht konvergiert "
               f"(err={ik_result.error:.3e}) -- ueberspringe")
