@@ -165,6 +165,9 @@ def main():
         time.sleep(PAUSE_BETWEEN_POSES)
 
     print("\nWiedergabe beendet." if not should_exit else "\nAbgebrochen.")
+    print("Fenster bleibt offen, damit du dir die Endpose ansehen kannst -- Strg+C zum Beenden.")
+    while not should_exit:
+        time.sleep(0.5)
 
 
 if __name__ == "__main__":
