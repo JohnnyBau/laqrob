@@ -52,13 +52,13 @@ from example.sim.visualizer import Visualizer
 WINDOW_S = 20.0
 SAMPLE_HZ = 20.0
 N = int(WINDOW_S * SAMPLE_HZ)
-STATUS_INTERVAL_S = 10.0
+STATUS_INTERVAL_S = 1.0
 STATUS_HTTP_PORT = 8990
 
 _status_lock = threading.Lock()
 _status_holder = {"text": "warte auf erstes Update...", "saved_msg": ""}
 _state_lock = threading.Lock()
-_latest_state = {"q": None, "pos": None, "rpy": None}
+_latest_state = {"q": None, "pos": None, "rpy": None, "vec": None}
 _n_arm = None  # von run() gesetzt
 _has_gripper = False  # von run() gesetzt
 _session_saves: list[dict] = []  # in dieser Sitzung gespeicherte Posen -- Rueckgabe von run()
@@ -67,6 +67,7 @@ _session_saves: list[dict] = []  # in dieser Sitzung gespeicherte Posen -- Rueck
 def _save_pose(name: str, gripper: str) -> str:
     with _state_lock:
         q, pos, rpy = _latest_state["q"], _latest_state["pos"], _latest_state["rpy"]
+        vec = _latest_state["vec"]
     if q is None:
         return "Noch keine Pose verfuegbar -- kurz warten und erneut versuchen."
     poses = load_poses()
@@ -75,11 +76,14 @@ def _save_pose(name: str, gripper: str) -> str:
         "name": name if name else f"pose_{len(poses) + 1}",
         "x": float(pos[0]), "y": float(pos[1]), "z": float(pos[2]),
         "roll": float(rpy[0]), "pitch": float(rpy[1]), "yaw": float(rpy[2]),
+        "vx": float(vec[0]), "vy": float(vec[1]), "vz": float(vec[2]),
         "duration": 2.0,
         "gripper": gripper if gripper in ("open", "close") else "none",
         "gripper_pos": gripper_pos,
         # reale Gelenkwinkel: playback.py faehrt darauf direkt (Min-Jerk, keine IK).
         "q": [float(v) for v in q[:_n_arm]],
+        # alle Gelenkwinkel inkl. Greifer (letzter Wert), unabhaengig von playback.py.
+        "q_full": [float(v) for v in q],
     }
     poses.append(entry)
     save_poses(poses)
@@ -102,14 +106,33 @@ class _StatusHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
 
+        if parsed.path == "/status_text":
+            # separater Endpunkt fuers AJAX-Polling -- kein voller Seiten-Reload, sonst geht das Formular beim Tippen verloren.
+            with _status_lock:
+                text = _status_holder["text"]
+            body = text.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         with _status_lock:
             text = _status_holder["text"]
             saved_msg = _status_holder["saved_msg"]
         saved_html = f"<p style='color:green'>{html.escape(saved_msg)}</p>" if saved_msg else ""
         body = (
-            "<html><head><meta http-equiv='refresh' content='2'>"
-            "<meta charset='utf-8'></head><body>"
-            f"<pre style='font-size:18px'>{text}</pre>"
+            "<html><head><meta charset='utf-8'>"
+            "<script>"
+            "setInterval(function(){"
+            "fetch('/status_text').then(r=>r.text()).then(t=>{"
+            "document.getElementById('status').innerText = t;"
+            "});"
+            "}, 1000);"
+            "</script>"
+            "</head><body>"
+            f"<pre id='status' style='font-size:18px'>{text}</pre>"
             "<form action='/save' method='get'>"
             "Name: <input name='name' type='text'> "
             "Greifer: <select name='gripper'>"
@@ -195,10 +218,12 @@ def run() -> list[dict]:
         pos, rpy = joint_to_pose(q)
         rpy_deg = np.degrees(rpy)
         gripper_vec = pin.rpy.rpyToMatrix(*rpy) @ np.array([1.0, 0.0, 0.0])  # Greifrichtung = lokale X-Achse von end_link (per FK-Test verifiziert, nicht Z)
+        gripper_pos = float(q[_n_arm]) if _has_gripper else None  # Gelenkwinkel des Greifers (letztes Gelenk)
         with _state_lock:
             _latest_state["q"] = q.copy()
             _latest_state["pos"] = pos
             _latest_state["rpy"] = rpy
+            _latest_state["vec"] = gripper_vec
         t_buf.append(time.time() - t0)
         for i, v in enumerate(list(pos) + [rpy_deg[0]]):
             val_buf[i].append(v)
@@ -207,10 +232,14 @@ def run() -> list[dict]:
         viz.update(pad_q_for_model(viz.model, q))
         if t_buf[-1] - last_status_t >= STATUS_INTERVAL_S:
             last_status_t = t_buf[-1]
+            gripper_str = f"{gripper_pos:+.3f}" if gripper_pos is not None else "n/a"
+            q_str = ", ".join(f"{v:+.3f}" for v in q)  # alle Gelenkwinkel inkl. Greifer (letzter Wert)
             line_text = (
                 f"t={t_buf[-1]:6.1f}s  x={pos[0]:+.3f}  y={pos[1]:+.3f}  z={pos[2]:+.3f}  "
                 f"roll={rpy_deg[0]:+6.1f}  "
-                f"vec=({gripper_vec[0]:+.3f}, {gripper_vec[1]:+.3f}, {gripper_vec[2]:+.3f})"
+                f"vx={gripper_vec[0]:+.3f}  vy={gripper_vec[1]:+.3f}  vz={gripper_vec[2]:+.3f}  "
+                f"greiferoeffnung={gripper_str}\n"
+                f"q=[{q_str}]"
             )
             status_text.set_text(line_text)
             with _status_lock:
@@ -242,6 +271,10 @@ def run() -> list[dict]:
 
 
 def main() -> None:
+    antwort = input(f"Poses-Datei ({POSES_FILE}) vor dem Start leeren? [j/N]: ").strip().lower()
+    if antwort in ("j", "y", "ja", "yes"):
+        save_poses([])
+        print(f"{POSES_FILE} geleert.")
     saved = run()
     print(f"{len(saved)} Pose(n) in dieser Sitzung gespeichert.")
 
