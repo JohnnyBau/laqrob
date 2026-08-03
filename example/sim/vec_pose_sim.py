@@ -85,13 +85,13 @@ def main():
 
         result = compute_ik(None, target_pos, rot)
 
-        # compute_ik loest ueber das volle Modell (Arm + Greifer); die Greifer-
-        # Spalte der Jacobi-Matrix ist fuer die Endeffektor-Pose irrelevant,
-        # daher hier explizit mit der gewuenschten Greiferoeffnung ueberschreiben.
-        q_full = result.q.copy()
-        q_full[-1] = greifer
-        q_arm = q_full[:-1]
-        viz.update(q_full)
+        # Das Kinematik-/Visualisierungsmodell enthaelt nur die 6 Arm-Gelenke
+        # (kein Greifer-Gelenk), siehe robot_model.py / poses_fixed.json "q".
+        # Der Greifer ist ein separater, nicht von der IK betroffener Wert, der
+        # nur fuer die Ablage als 7. Eintrag an "q_full" angehaengt wird.
+        q_arm = result.q.copy()
+        q_full = np.append(q_arm, greifer)
+        viz.update(q_arm)
 
         status = "konvergiert" if result.success else "NICHT konvergiert"
         print(f"  IK {status}  (err={result.error:.3e}, iter={result.iterations})")
