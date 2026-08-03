@@ -141,7 +141,9 @@ def move_to_pose(viz, model, end_frame_id, q_start, pose, duration, dt=1.0 / 50.
 def main():
     signal.signal(signal.SIGINT, signal_handler)
 
-    poses_path = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_POSES_FILE
+    args = [a for a in sys.argv[1:] if a != "--loop"]
+    loop = "--loop" in sys.argv[1:]  # endlos zwischen den Posen hin- und herfahren, Strg+C zum Beenden
+    poses_path = Path(args[0]) if args else DEFAULT_POSES_FILE
     poses = load_poses(poses_path)
     print(f"{len(poses)} Pose(n) geladen aus {poses_path}")
 
@@ -154,15 +156,21 @@ def main():
     viz.update(q)
     print("Roboter in Nullstellung. Wiedergabe startet...\n")
 
-    for idx, pose in enumerate(poses):
-        if should_exit:
+    durchlauf = 0
+    while not should_exit:
+        durchlauf += 1
+        for idx, pose in enumerate(poses):
+            if should_exit:
+                break
+            name = pose.get("name", f"pose_{idx}")
+            duration = pose.get("duration", DEFAULT_DURATION)
+            prefix = f"(Durchlauf {durchlauf}) " if loop else ""
+            print(f"{prefix}[{idx + 1}/{len(poses)}] -> '{name}'  "
+                  f"pos=({pose['x']:.3f}, {pose['y']:.3f}, {pose['z']:.3f})")
+            q = move_to_pose(viz, model, end_frame_id, q, pose, duration)
+            time.sleep(PAUSE_BETWEEN_POSES)
+        if not loop:
             break
-        name = pose.get("name", f"pose_{idx}")
-        duration = pose.get("duration", DEFAULT_DURATION)
-        print(f"[{idx + 1}/{len(poses)}] -> '{name}'  "
-              f"pos=({pose['x']:.3f}, {pose['y']:.3f}, {pose['z']:.3f})")
-        q = move_to_pose(viz, model, end_frame_id, q, pose, duration)
-        time.sleep(PAUSE_BETWEEN_POSES)
 
     print("\nWiedergabe beendet." if not should_exit else "\nAbgebrochen.")
     print("Fenster bleibt offen, damit du dir die Endpose ansehen kannst -- Strg+C zum Beenden.")
