@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from reBotArm_control_py.kinematics import (
     compute_fk,
     get_end_effector_frame_id,
+    pad_q_for_model,
 )
 from reBotArm_control_py.trajectory import (
     plan_cartesian_geodesic_trajectory,
@@ -40,7 +41,8 @@ from reBotArm_control_py.trajectory import (
 )
 from example.sim.visualizer import Visualizer
 
-LINEAR_SPEED = 0.1
+LINEAR_SPEED = 0.5
+JOINT_SPEED = 3.0  # rad/s fuer Gelenkraum-Zwischenposen
 should_exit = False
 
 
@@ -55,10 +57,41 @@ def make_pose(x: float, y: float, z: float,
 
 
 def _solve_ik(model, end_frame_id, target, q_init, ik_params):
-    from reBotArm_control_py.kinematics.inverse_kinematics import solve_ik
+    # solve_ik_with_retry vermeidet, dass ein einzelner schlechter Seed (z.B. nach
+    # vorheriger IK-Fehlschlagsposition) alle Folgeposen kaskadierend fehlschlagen laesst.
+    from reBotArm_control_py.kinematics.inverse_kinematics import solve_ik_with_retry
     data = model.createData()
-    result = solve_ik(model, data, end_frame_id, target, q_init, ik_params)
+    result = solve_ik_with_retry(model, data, end_frame_id, target, q_init.copy(), ik_params)
     return result.q, result.success
+
+
+def run_joint_trajectory(viz, model, end_frame_id, q_start, q_target_arm, dt=1.0/50.0, speed=None):
+    """Interpoliert linear im Gelenkraum, zeichnet EE-Spur."""
+    q_target = pad_q_for_model(model, q_target_arm)
+    dist = float(np.max(np.abs(q_target - q_start)))
+    duration = max(0.3, dist / (speed if speed is not None else JOINT_SPEED))
+    n_steps = max(2, int(duration / dt))
+
+    ee_positions = []
+    data = model.createData()
+    viz.clear_paths()
+    viz.clear_trajectory_line()
+
+    print(f"  Gelenkraum-Fahrt: {np.degrees(q_target_arm).round(1).tolist()}")
+    for i in range(n_steps + 1):
+        if should_exit:
+            break
+        alpha = i / n_steps
+        q_interp = q_start + alpha * (q_target - q_start)
+        viz.update(q_interp)
+        _, _, T = compute_fk(model, q_interp)
+        ee_positions.append(T[:3, 3].tolist())
+        viz.draw_actual_path(ee_positions)
+        if i < n_steps:
+            time.sleep(max(0.002, dt))
+
+    print("  动画播放完毕。")
+    return q_target.copy()
 
 
 def run_trajectory(viz, model, end_frame_id, q_start, q_end,
@@ -192,10 +225,43 @@ def main():
             break
 
         parts = line.split()
+
+        # Gelenkraum-Befehl: "j q0 q1 q2 q3 q4 q5"
+        if parts[0] == "j" and len(parts) >= 7:
+            try:
+                q_arm = np.array([float(x) for x in parts[1:7]])
+            except ValueError:
+                print("  Format: j q0 q1 q2 q3 q4 q5 (rad)")
+                continue
+            q_last = run_joint_trajectory(viz, model, end_frame_id, q_last, q_arm, dt)
+            viz.update(q_last)
+            continue
+
+        # j6-Only: dreht nur Gelenk 6, alle anderen Gelenke bleiben
+        if parts[0] == "j6" and len(parts) == 2:
+            try:
+                j6_target = float(parts[1])
+            except ValueError:
+                print("  Format: j6 <rad>")
+                continue
+            q_arm_target = q_last[:6].copy()
+            q_arm_target[5] = j6_target
+            q_last = run_joint_trajectory(viz, model, end_frame_id, q_last, q_arm_target, dt)
+            viz.update(q_last)
+            continue
+
+        # optionaler j6=<rad> Suffix überschreibt j6 im IK-Seed
+        j6_seed = None
+        filtered = [p for p in parts if not p.startswith("j6=")]
+        for p in parts:
+            if p.startswith("j6="):
+                j6_seed = float(p[3:])
+        parts = filtered
+
         try:
             vals = [float(x) for x in parts]
         except ValueError:
-            print("  格式: x y z [roll pitch yaw]")
+            print("  格式: x y z [roll pitch yaw] | j q0..q5")
             continue
 
         x, y, z = vals[0], vals[1], vals[2]
@@ -204,14 +270,20 @@ def main():
         yaw = vals[5] if len(vals) >= 6 else 0.0
         target_pose = make_pose(x, y, z, roll, pitch, yaw)
 
+        ik_seed = q_last.copy()
+        if j6_seed is not None:
+            ik_seed[5] = j6_seed
         ik_res_q, ik_success = _solve_ik(
-            model, end_frame_id, target_pose, q_last, ik_params
+            model, end_frame_id, target_pose, ik_seed, ik_params
         )
+        if j6_seed is not None:
+            ik_res_q = ik_res_q.copy()
+            ik_res_q[5] = j6_seed  # j6 im Ergebnis erzwingen, damit FK das richtige Ziel liefert
         if not ik_success:
             print("  IK 无解\n")
             continue
 
-        duration = max(1.0, np.linalg.norm(target_pose.translation - T0[:3, 3]) / LINEAR_SPEED)
+        duration = max(0.3, np.linalg.norm(target_pose.translation - T0[:3, 3]) / LINEAR_SPEED)
 
         t0 = time.time()
         _, joint_traj, _, _ = run_trajectory(
