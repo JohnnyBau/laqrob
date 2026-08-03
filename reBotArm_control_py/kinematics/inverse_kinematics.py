@@ -67,6 +67,41 @@ def pos_rot_to_se3(
     return pin.SE3(rot, pos)
 
 
+def direction_roll_to_matrix(
+    direction: np.ndarray,
+    roll: float,
+    up_ref: np.ndarray = (0.0, 0.0, 1.0),
+) -> np.ndarray:
+    """Baut eine Rotationsmatrix aus Werkzeugrichtung + Rollwinkel um diese Achse.
+
+    Die lokale X-Achse (Werkzeugspitze) zeigt entlang `direction`. Bei `roll=0`
+    liegt die lokale Y-Achse in der von `direction` und `up_ref` aufgespannten
+    Ebene (analog zu `direction_to_rot` in poses_sim.py); `roll` dreht die
+    Y/Z-Achsen zusaetzlich um die Werkzeugachse.
+
+    参数:
+        direction: (3,) Werkzeugrichtung, wird normiert.
+        roll:      Rollwinkel um die Werkzeugachse, in Radiant.
+        up_ref:    Referenz-"oben"-Vektor fuer die Roll=0-Lage. Faellt auf die
+                   globale Y-Achse zurueck, falls (nahezu) parallel zu `direction`.
+
+    返回:
+        (3, 3) Rotationsmatrix.
+    """
+    x = np.asarray(direction, dtype=float)
+    x = x / np.linalg.norm(x)
+    up = np.asarray(up_ref, dtype=float)
+    if abs(np.dot(x, up / np.linalg.norm(up))) > 0.99:
+        up = np.array([0.0, 1.0, 0.0])
+    y0 = np.cross(up, x)
+    y0 /= np.linalg.norm(y0)
+    z0 = np.cross(x, y0)
+    r0 = np.column_stack([x, y0, z0])
+    c, s = np.cos(roll), np.sin(roll)
+    rot_x = np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]])
+    return r0 @ rot_x
+
+
 def _clamp_config(model: pin.Model, q: np.ndarray) -> np.ndarray:
     """将 q 限制在关节限位范围内。
 
