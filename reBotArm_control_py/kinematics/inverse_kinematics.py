@@ -193,12 +193,12 @@ def solve_ik_with_retry(
     target: pin.SE3,
     q_seed: np.ndarray,
     params: Optional[IKParams] = None,
-    max_retries: int = 8,
+    max_retries: int = 30,
 ) -> IKResult:
     """带随机重试的 IK 求解器。
 
       - 先用 q_seed 求解一次
-      - 若失败则在关节限位内随机采样最多 max_retries 次
+      - 若失败则在关节限位内随机采样最多 max_retries 次（默认较多，宁可多花时间也不轻易放弃）
       - 返回误差最小的结果
 
     参数:
@@ -277,4 +277,5 @@ def compute_ik(
     if q_init is None:
         q_init = pin.neutral(model)
 
-    return solve_ik(model, data, frame_id, target, q_init, params)
+    # Retry-Loeser statt Einzelversuch: gibt bei ungueenstiger Startkonfiguration nicht sofort auf
+    return solve_ik_with_retry(model, data, frame_id, target, q_init.copy(), params)
